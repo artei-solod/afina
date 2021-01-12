@@ -94,9 +94,11 @@ void Worker::OnRun() {
             Connection *pconn = static_cast<Connection *>(current_event.data.ptr);
             if ((current_event.events & EPOLLERR) || (current_event.events & EPOLLHUP)) {
                 _logger->debug("Got EPOLLERR or EPOLLHUP, value of returned events: {}", current_event.events);
+                pconn->DoWrite();
                 pconn->OnError();
             } else if (current_event.events & EPOLLRDHUP) {
                 _logger->debug("Got EPOLLRDHUP, value of returned events: {}", current_event.events);
+                pconn->DoWrite();
                 pconn->OnClose();
             } else {
                 // Depends on what connection wants...
@@ -117,6 +119,7 @@ void Worker::OnRun() {
                 if ((epoll_ctl_retval = epoll_ctl(_epoll_fd, EPOLL_CTL_MOD, pconn->_socket, &pconn->_event))) {
                     _logger->debug("epoll_ctl failed during connection rearm: error {}", epoll_ctl_retval);
                     pconn->OnError();
+                    close(pconn->_socket);
                     delete pconn;
                 }
             }
@@ -125,6 +128,7 @@ void Worker::OnRun() {
                 if (epoll_ctl(_epoll_fd, EPOLL_CTL_DEL, pconn->_socket, &pconn->_event)) {
                     std::cerr << "Failed to delete connection!" << std::endl;
                 }
+                close(pconn->_socket);
                 delete pconn;
             }
         }
