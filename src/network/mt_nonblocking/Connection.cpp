@@ -10,64 +10,39 @@ namespace MTnonblock {
 
 // See Connection.h
 void Connection::Start() {
-    _logger->info("Start st_nonblocking network connection on descriptor {} \n", _socket);
-    std::unique_lock<std::mutex> lock(mutex);
-    _is_alive = true;
-    // EPOLLIN - The associated file is available for read(2) operations.
-    // EPOLLPRI - There is urgent data available for read(2) operations.
-    // EPOLLRDHUP - Stream socket peer closed connection, or shut down writing half of connection.
-    // EPOLLERR - Error condition happened on the associated file descriptor
-    _event.events = EPOLLIN | EPOLLPRI | EPOLLRDHUP; //| EPOLLERR;
-    command_to_execute.reset();
-    argument_for_command.resize(0);
-    parser.Reset();
-    arg_remains = 0;
-
-    // Prepare for reading
-    _written_bytes = 0;
-    _read_bytes = 0;
-    _results.clear();
-    _event.data.ptr = this;
+    _logger->debug("Connection on {} socket started", _socket);
+    _event.events = EPOLLIN | EPOLLRDHUP | EPOLLERR;
+    running.store(true);
+	shift = 0;
 }
-
 // See Connection.h
 void Connection::OnError() {
-    _logger->error("Error in connection on descriptor {} \n", _socket);
-    std::unique_lock<std::mutex> lock(mutex);
-    OnClose();
+    running.store(false);
+    _logger->error("Error on socket {}", _socket);
 }
 
 // See Connection.h
 void Connection::OnClose() {
-    _logger->debug("Close connection of descriptor {} \n", _socket);
-    std::unique_lock<std::mutex> lock(mutex);
-    _is_alive = false;
+    running.store(false);
+    _logger->debug("Closed connection on socket {}", _socket);
 }
 
 // See Connection.h
-void Connection::DoRead() {
-    _logger->debug("Read from connection on descriptor {} \n", _socket);
-    std::unique_lock<std::mutex> lock(mutex);
-    int client_socket = _socket;
-    command_to_execute = nullptr;
-    try {
-        _bytes_for_read = 0;
-        while ((_bytes_for_read =
-                    read(client_socket, client_buffer + _read_bytes, sizeof(client_buffer) - _read_bytes)) > 0) {
-            //_logger->debug("Got {} bytes from socket", _read_bytes);
-            _read_bytes += _bytes_for_read;
-            // Single block of data readed from the socket could trigger inside actions a multiple times,
-            // for example:
-            // - read#0: [<command1 start>]
-            // - read#1: [<command1 end> <argument> <command2> <argument for command 2> <command3> ... ]
-            while (_read_bytes > 0) {
-                _logger->debug("Process {} bytes", _read_bytes);
-                // There is no command yet
+void Connection::DoRead() {	
+	std::atomic_thread_fence(std::memory_order_acquire);
+	std::size_t arg_remains=0;
+	Protocol::Parser parser;
+	std::string argument_for_command;
+	try {
+		int readed_bytes = -1;
+		while ((readed_bytes = read(_socket, client_buffer + now_pos, sizeof(client_buffer) - now_pos)) > 0) {
+			_logger->debug("Got {} bytes from socket", readed_bytes);
+			now_pos += readed_bytes;
+            while (now_pos > 0) {
+                _logger->debug("Process {} bytes", now_pos);
                 if (!command_to_execute) {
                     std::size_t parsed = 0;
-                    if (parser.Parse(client_buffer, _read_bytes, parsed)) {
-                        // There is no command to be launched, continue to parse input stream
-                        // Here we are, current chunk finished some command, process it
+                    if (parser.Parse(client_buffer, now_pos, parsed)) {
                         _logger->debug("Found new command: {} in {} bytes", parser.Name(), parsed);
                         command_to_execute = parser.Build(arg_remains);
                         if (arg_remains > 0) {
@@ -75,103 +50,108 @@ void Connection::DoRead() {
                         }
                     }
 
-                    // Parsed might fails to consume any bytes from input stream. In real life that could happens,
-                    // for example, because we are working with UTF-16 chars and only 1 byte left in stream
                     if (parsed == 0) {
                         break;
                     } else {
-                        std::memmove(client_buffer, client_buffer + parsed, _read_bytes - parsed);
-                        _read_bytes -= parsed;
+                        std::memmove(client_buffer, client_buffer + parsed, now_pos - parsed);
+                        now_pos -= parsed;
                     }
                 }
 
-                // There is command, but we still wait for argument to arrive...
                 if (command_to_execute && arg_remains > 0) {
-                    _logger->debug("Fill argument: {} bytes of {}", _read_bytes, arg_remains);
-                    // There is some parsed command, and now we are reading argument
-                    std::size_t to_read = std::min(arg_remains, std::size_t(_read_bytes));
+                    _logger->debug("Fill argument: {} bytes of {}", now_pos, arg_remains);
+                    std::size_t to_read = std::min(arg_remains, std::size_t(now_pos));
                     argument_for_command.append(client_buffer, to_read);
-                    std::memmove(client_buffer, client_buffer + to_read, _read_bytes - to_read);
+
+                    std::memmove(client_buffer, client_buffer + to_read, now_pos - to_read);
                     arg_remains -= to_read;
-                    _read_bytes -= to_read;
+                    now_pos -= to_read;
                 }
 
-                // Thre is command & argument - RUN!
                 if (command_to_execute && arg_remains == 0) {
                     _logger->debug("Start command execution");
 
                     std::string result;
                     command_to_execute->Execute(*pStorage, argument_for_command, result);
-                    bool stupflag = _results.empty();
-                    // Send response
-                    result += "\r\n";
-                    _results.push_back(result);
-                    if (stupflag) {
-                        _event.events |= EPOLLOUT;
-                    };
 
-                    // Prepare for the next command
+                    result += "\r\n";
+                    buffer.push_back(result);
+					if (buffer.size() > N){
+                                            _event.events &= ~EPOLLIN;
+                                        }
+
+                    if (buffer.size() > 0) {
+                        _event.events |= EPOLLOUT;
+                    }
                     command_to_execute.reset();
                     argument_for_command.resize(0);
                     parser.Reset();
                 }
-            } // while (readed_bytes)
+            } // while end
         }
-        if (arg_remains == 0) {
+        if (readed_bytes == 0) {
             _logger->debug("Connection closed");
+			running.store(false);
         } else {
             throw std::runtime_error(std::string(strerror(errno)));
         }
     } catch (std::runtime_error &ex) {
         if (errno != EAGAIN) {
             _logger->error("Failed to read connection on descriptor {}: {}", _socket, ex.what());
+			running.store(false);
         }
-    }
+	}
+	std::atomic_thread_fence(std::memory_order_release);
 }
-        // EAGAIN - Resource temporarily unvailable
-        //_logger->debug("Client stop to write to connection on descriptor {}", client_socket);
-        //if (errno == EAGAIN) {
-            //throw std::runtime_error(std::string(strerror(errno)));
-        //}
-    //} catch (std::runtime_error &ex) {
-        //_logger->error("failed to read from connection on descriptor {}: {}", client_socket, ex.what());
-    //}
-//}
 
-// See Connection.h
+		
 void Connection::DoWrite() {
-    _logger->debug("Writing in connection on descriptor {} \n", _socket);
-    std::unique_lock<std::mutex> lock(mutex);
-    assert(!_results.empty());
+	std::atomic_thread_fence(std::memory_order_acquire);
+    _logger->debug("Writing on socket {}", _socket);
+	static constexpr size_t max_buffer = 64;
+	iovec write_vec[max_buffer];
+    size_t write_vec_v = 0;
     try {
-        std::size_t size = _results.size();
-        auto it = _results.begin();
-        struct iovec iov[size];
-        for (std::size_t i = 0; i < size; ++i, ++it) {
-            iov[i].iov_base = &(*it)[0]; // begin of string, which in vector;
-            iov[i].iov_len = (*it).size();
+		auto it = buffer.begin();
+        write_vec[write_vec_v].iov_base = &((*it)[0]) + shift;
+		write_vec[write_vec_v].iov_len = it->size() - shift;
+        it++;
+        write_vec_v++;
+		for (; it != buffer.end(); it++) {
+            write_vec[write_vec_v].iov_base = &((*it)[0]);
+            write_vec[write_vec_v].iov_len = it->size();
+            if (++write_vec_v > max_buffer) {
+                break;
+            }
         }
-        iov[0].iov_base = (char *)iov[0].iov_base + _written_bytes;
-        iov[0].iov_len -= _written_bytes;
+		int writed = 0;
+        if ((writed = writev(_socket, write_vec, write_vec_v)) >= 0) {
+			size_t i = 0;
+			while (i < write_vec_v && writed >= write_vec[i].iov_len) {
 
-        int written = writev(_socket, iov, size);
-        _written_bytes += written;
-        it = _results.begin();
-        while (it != _results.end() && _written_bytes >= it->size()) {
-            _written_bytes -= it->size();
-            ++it;
+				buffer.pop_front();
+				writed -= write_vec[i].iov_len;
+				i++;
+			}
+			shift = writed;
+		} else {
+			throw std::runtime_error("Failed to send response");
+		}
+        if (buffer.empty()) {
+            _event.events &= ~EPOLLOUT;
         }
-
-        _results.erase(_results.begin(), it);
-        if (_results.empty()) {
-            _event.events |= EPOLLIN;
-        }
+		if (buffer.size() <= N){
+			_event.events |= EPOLLIN;
+		}
     } catch (std::runtime_error &ex) {
-        _logger->error("Failed to writing to connection on descriptor {}: {} \n", _socket, ex.what());
-        _is_alive = false;
-    }
+        if (errno != EAGAIN) {
+            _logger->error("Failed to write connection on descriptor {}: {}", _socket, ex.what());
+			running.store(false);
+        }
+	}
+	std::atomic_thread_fence(std::memory_order_release);
 }
 
 } // namespace MTnonblock
 } // namespace Network
-} // namespace Afina sdverdv dcsvdfvd
+} // namespace Afina

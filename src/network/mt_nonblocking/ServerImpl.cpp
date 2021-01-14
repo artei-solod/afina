@@ -33,7 +33,10 @@ namespace MTnonblock {
 ServerImpl::ServerImpl(std::shared_ptr<Afina::Storage> ps, std::shared_ptr<Logging::Service> pl) : Server(ps, pl) {}
 
 // See Server.h
-ServerImpl::~ServerImpl() {}
+ServerImpl::~ServerImpl() {
+	Stop();
+	Join();
+}
 
 // See Server.h
 void ServerImpl::Start(uint16_t port, uint32_t n_acceptors, uint32_t n_workers) {
@@ -64,6 +67,11 @@ void ServerImpl::Start(uint16_t port, uint32_t n_acceptors, uint32_t n_workers) 
         close(_server_socket);
         throw std::runtime_error("Socket setsockopt() failed: " + std::string(strerror(errno)));
     }
+	
+	if (setsockopt(_server_socket, SOL_SOCKET, SO_REUSEADDR, &opts, sizeof(opts)) == -1) {
+		close(_server_socket);
+		throw std::runtime_error("Socket setsockopt() failed");
+	}
 
     if (bind(_server_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1) {
         close(_server_socket);
@@ -96,8 +104,9 @@ void ServerImpl::Start(uint16_t port, uint32_t n_acceptors, uint32_t n_workers) 
 
     _workers.reserve(n_workers);
     for (int i = 0; i < n_workers; i++) {
+		work_cnt++;
         _workers.emplace_back(pStorage, pLogging);
-        _workers.back().Start(_data_epoll_fd);
+        _workers.back().Start(_data_epoll_fd, this);
     }
 
     // Start acceptors
@@ -109,24 +118,21 @@ void ServerImpl::Start(uint16_t port, uint32_t n_acceptors, uint32_t n_workers) 
 
 // See Server.h
 void ServerImpl::Stop() {
-    std::unique_lock<std::mutex> lock(mutex);
     _logger->warn("Stop network service");
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        for (auto &it : connection_set) {
+            shutdown(it->_socket, SHUT_RD);
+        }
+    }
     // Said workers to stop
     for (auto &w : _workers) {
         w.Stop();
     }
-
     // Wakeup threads that are sleep on epoll_wait
     if (eventfd_write(_event_fd, 1)) {
         throw std::runtime_error("Failed to wakeup workers");
     }
-    if (_workers.size() == 1){
-    for(auto &it: _connections)
-    {
-        close(it->_socket);
-        delete it;
-    }}
-    //close(_server_socket);
 }
 
 // See Server.h
@@ -134,10 +140,11 @@ void ServerImpl::Join() {
     for (auto &t : _acceptors) {
         t.join();
     }
-
+    _acceptors.clear();
     for (auto &w : _workers) {
         w.Join();
     }
+    _workers.clear();
 }
 
 // See ServerImpl.h
@@ -149,7 +156,7 @@ void ServerImpl::OnRun() {
     }
 
     struct epoll_event event;
-    event.events = EPOLLIN | EPOLLEXCLUSIVE;
+    event.events = EPOLLIN;
     event.data.fd = _server_socket;
     if (epoll_ctl(acceptor_epoll, EPOLL_CTL_ADD, _server_socket, &event)) {
         throw std::runtime_error("Failed to add file descriptor to epoll");
@@ -205,27 +212,48 @@ void ServerImpl::OnRun() {
                 if (pc == nullptr) {
                     throw std::runtime_error("Failed to allocate connection");
                 }
-
                 // Register connection in worker's epoll
                 pc->Start();
                 if (pc->isAlive()) {
-                    pc->_event.events |= EPOLLET;
                     pc->_event.events |= EPOLLONESHOT;
                     int epoll_ctl_retval;
                     if ((epoll_ctl_retval = epoll_ctl(_data_epoll_fd, EPOLL_CTL_ADD, pc->_socket, &pc->_event))) {
                         _logger->debug("epoll_ctl failed during connection register in workers'epoll: error {}", epoll_ctl_retval);
-                        pc->OnError();
+                        close(pc->_socket);
+						pc->OnError();
                         delete pc;
                     }else{
-                        std::lock_guard<std::mutex> lock(_mutex);
-                        _connections.insert(pc);
-                    }
+						std::lock_guard<std::mutex> lock(_mutex);
+						connection_set.insert(pc);
+					}
                 }
             }
         }
     }
-    close(_server_socket);
     _logger->warn("Acceptor stopped");
+}
+
+void ServerImpl::clear_cs(){
+	std::lock_guard<std::mutex> lock(_mutex);
+	for(auto &it: connection_set){
+		close(it->_socket);
+		delete it;
+	}
+}
+
+bool ServerImpl::is_last(){
+    std::lock_guard<std::mutex> lock(_mutex);
+    return work_cnt == 1;
+}
+
+void ServerImpl::dec_work_cnt(){
+	std::lock_guard<std::mutex> lock(_mutex);
+	work_cnt--;
+}
+
+void ServerImpl::er(Connection *pconn) {
+    std::lock_guard<std::mutex> lock(_mutex);
+    connection_set.erase(pconn);
 }
 
 } // namespace MTnonblock

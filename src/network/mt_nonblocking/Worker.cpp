@@ -47,12 +47,12 @@ Worker &Worker::operator=(Worker &&other) {
 }
 
 // See Worker.h
-void Worker::Start(int epoll_fd) {
+void Worker::Start(int epoll_fd, ServerImpl * S) {
     if (isRunning.exchange(true) == false) {
         assert(_epoll_fd == -1);
         _epoll_fd = epoll_fd;
         _logger = _pLogging->select("network.worker");
-        _thread = std::thread(&Worker::OnRun, this);
+        _thread = std::thread(&Worker::OnRun, this, S);
     }
 }
 
@@ -66,7 +66,7 @@ void Worker::Join() {
 }
 
 // See Worker.h
-void Worker::OnRun() {
+void Worker::OnRun(ServerImpl * S) {
     assert(_epoll_fd >= 0);
     _logger->trace("OnRun");
 
@@ -94,11 +94,9 @@ void Worker::OnRun() {
             Connection *pconn = static_cast<Connection *>(current_event.data.ptr);
             if ((current_event.events & EPOLLERR) || (current_event.events & EPOLLHUP)) {
                 _logger->debug("Got EPOLLERR or EPOLLHUP, value of returned events: {}", current_event.events);
-                pconn->DoWrite();
                 pconn->OnError();
             } else if (current_event.events & EPOLLRDHUP) {
                 _logger->debug("Got EPOLLRDHUP, value of returned events: {}", current_event.events);
-                pconn->DoWrite();
                 pconn->OnClose();
             } else {
                 // Depends on what connection wants...
@@ -119,7 +117,6 @@ void Worker::OnRun() {
                 if ((epoll_ctl_retval = epoll_ctl(_epoll_fd, EPOLL_CTL_MOD, pconn->_socket, &pconn->_event))) {
                     _logger->debug("epoll_ctl failed during connection rearm: error {}", epoll_ctl_retval);
                     pconn->OnError();
-                    close(pconn->_socket);
                     delete pconn;
                 }
             }
@@ -129,11 +126,17 @@ void Worker::OnRun() {
                     std::cerr << "Failed to delete connection!" << std::endl;
                 }
                 close(pconn->_socket);
+                S->er(pconn);
                 delete pconn;
             }
         }
         // TODO: Select timeout...
     }
+	if (S->is_last()){};
+	{
+		S->clear_cs();
+	}
+	S->dec_work_cnt();
     _logger->warn("Worker stopped");
 }
 
