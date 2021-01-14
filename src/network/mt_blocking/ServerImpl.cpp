@@ -101,6 +101,7 @@ void ServerImpl::Join() {
 
 // See Server.h
 void ServerImpl::OnRun() {
+
     // Here is connection state
     // - parser: parse state of the stream
     // - command_to_execute: last command parsed out of stream
@@ -143,15 +144,26 @@ void ServerImpl::OnRun() {
         }
 
         // TODO: Start new thread and process data from/to connection
-        {
-            static const std::string msg = "TODO: start new thread and process memcached protocol instead";
-            if (send(client_socket, msg.data(), msg.size(), 0) <= 0) {
-                _logger->error("Failed to write response to client: {}", strerror(errno));
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (running){
+            _current_client_sockets.insert(client_socket);
+            if (!thread_pool.Execute(&ServerImpl::Worker, this, client_socket)){
+                close(client_socket);
+                _current_client_sockets.erase(client_socket);
             }
+        } else {
             close(client_socket);
         }
     }
 
+            close(client_socket);
+        {
+        std::unique_lock<std::mutex> lock(_mutex);
+        for (auto client : _current_client_sockets){
+            shutdown(client, SHUT_RD);
+        }
+    }
+    thread_pool.Stop(true);
     // Cleanup on exit...
     _logger->warn("Network stopped");
 }
