@@ -147,7 +147,7 @@ void ServerImpl::OnRun() {
         std::lock_guard<std::mutex> lock(_mutex);
         if (running){
             _current_client_sockets.insert(client_socket);
-            if (!thread_pool.Execute(&ServerImpl::Worker, this, client_socket)){
+            if (!thread_pool.Execute(&ServerImpl::RUN, this, client_socket)){
                 close(client_socket);
                 _current_client_sockets.erase(client_socket);
             }
