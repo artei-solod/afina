@@ -35,6 +35,7 @@ ServerImpl::~ServerImpl() {}
 
 // See Server.h
 void ServerImpl::Start(uint16_t port, uint32_t n_accept, uint32_t n_workers) {
+    _max_workers = n_workers;
     _logger = pLogging->select("network");
     _logger->info("Start mt_blocking network service");
 
@@ -80,37 +81,25 @@ void ServerImpl::Start(uint16_t port, uint32_t n_accept, uint32_t n_workers) {
 void ServerImpl::Stop() {
     running.store(false);
     shutdown(_server_socket, SHUT_RDWR);
-    {
-        std::lock_guard<std::mutex> lock(_mutex);
-        for (auto &_w : _workers)
-            shutdown(_w.first, SHUT_RD);
+    std::lock_guard<std::mutex> lock(_mutex);
+    for (auto client_socket : _client_sockets){
+        shutdown(client_socket, SHUT_RD);
     }
 }
 
 // See Server.h
 void ServerImpl::Join() {
-    {
-        std::unique_lock<std::mutex> lock(_mutex);
-        while (!_workers.empty())
-            _join_threads.wait(lock);
-    }
     assert(_thread.joinable());
     _thread.join();
     close(_server_socket);
+    std::unique_lock<std::mutex> lock(_mutex);
+    while (!_client_sockets.empty()){
+        _all_workers_done.wait(lock);
+    }
 }
 
 // See Server.h
 void ServerImpl::OnRun() {
-
-    // Here is connection state
-    // - parser: parse state of the stream
-    // - command_to_execute: last command parsed out of stream
-    // - arg_remains: how many bytes to read from stream to get command argument
-    // - argument_for_command: buffer stores argument
-    std::size_t arg_remains;
-    Protocol::Parser parser;
-    std::string argument_for_command;
-    std::unique_ptr<Execute::Command> command_to_execute;
     while (running.load()) {
         _logger->debug("waiting for connection...");
 
@@ -143,36 +132,28 @@ void ServerImpl::OnRun() {
             setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof tv);
         }
 
-        // TODO: Start new thread and process data from/to connection
         std::lock_guard<std::mutex> lock(_mutex);
-        if (running){
-            _current_client_sockets.insert(client_socket);
-            if (!thread_pool.Execute(&ServerImpl::RUN, this, client_socket)){
-                close(client_socket);
-                _current_client_sockets.erase(client_socket);
-            }
+        if (_client_sockets.size() < _max_workers){
+            _client_sockets.insert(client_socket);
+            std::thread(&ServerImpl::Worker, this, client_socket).detach();
         } else {
             close(client_socket);
         }
     }
-
-            close(client_socket);
-        {
-        std::unique_lock<std::mutex> lock(_mutex);
-        for (auto client : _current_client_sockets){
-            shutdown(client, SHUT_RD);
-        }
-    }
-    thread_pool.Stop(true);
     // Cleanup on exit...
     _logger->warn("Network stopped");
 }
-void ServerImpl::RUN(int client_socket) {
+
+void ServerImpl::Worker(int client_socket) {
+    // Here is connection state 
+    // - parser: parse state of the stream
+    // - command_to_execute: last command parsed out of stream
+    // - arg_remains: how many bytes to read from stream to get command argument
+    // - argument_for_command: buffer stores argument
     std::size_t arg_remains;
     Protocol::Parser parser;
     std::string argument_for_command;
     std::unique_ptr<Execute::Command> command_to_execute;
-
     try {
         int readed_bytes = -1;
         char client_buffer[4096];
@@ -225,6 +206,9 @@ void ServerImpl::RUN(int client_socket) {
                     _logger->debug("Start command execution");
 
                     std::string result;
+                    if (argument_for_command.size()) {
+                        argument_for_command.resize(argument_for_command.size() - 2);
+                    }
                     command_to_execute->Execute(*pStorage, argument_for_command, result);
 
                     // Send response
@@ -250,19 +234,14 @@ void ServerImpl::RUN(int client_socket) {
         _logger->error("Failed to process connection on descriptor {}: {}", client_socket, ex.what());
     }
 
+    close(client_socket);
+    std::lock_guard<std::mutex> lock(_mutex);
+    _client_sockets.erase(client_socket);
+    if (_client_sockets.empty() && !running.load())
+        _all_workers_done.notify_all();
 
-
-    // Prepare for the next command: just in case if connection was closed in the middle of executing something
-    {
-        std::lock_guard<std::mutex> lock(_mutex);
-        auto it = _workers.find(client_socket);
-        it->second.detach();
-        _workers.erase(it);
-        close(client_socket);
-        if ((_workers.size() == 0) && !running.load())
-            _join_threads.notify_all();
-    }
 }
+
 } // namespace MTblocking
 } // namespace Network
 } // namespace Afina
